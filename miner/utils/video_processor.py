@@ -11,7 +11,7 @@ class VideoProcessor:
     
     def __init__(
         self,
-        device: str = "cpu",
+        device: str = "cuda",
         cuda_timeout: float = 900.0,  # 15 minutes for CUDA
         mps_timeout: float = 1800.0,  # 30 minutes for MPS
         cpu_timeout: float = 10800.0,  # 3 hours for CPU

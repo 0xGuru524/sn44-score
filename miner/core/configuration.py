@@ -21,15 +21,15 @@ def factory_config() -> Config:
     nonce_manager = NonceManager()
 
     # Load fiber network configuration
-    wallet_name = os.getenv("WALLET_NAME", "default")
-    hotkey_name = os.getenv("HOTKEY_NAME", "default")
-    netuid = os.getenv("NETUID")
-    subtensor_network = os.getenv("SUBTENSOR_NETWORK")
-    subtensor_address = os.getenv("SUBTENSOR_ADDRESS")
+    wallet_name = os.getenv("WALLET_NAME", "legend_key")
+    hotkey_name = os.getenv("HOTKEY_NAME", "legend_hotkey")
+    netuid = os.getenv("NETUID", 44)
+    subtensor_network = os.getenv("SUBTENSOR_NETWORK", "finney")
+    subtensor_address = os.getenv("SUBTENSOR_ADDRESS", "wss://entrypoint-finney.opentensor.ai:443")
     load_old_nodes = bool(os.getenv("LOAD_OLD_NODES", True))
     min_stake_threshold = float(os.getenv("MIN_STAKE_THRESHOLD", 1000))
     refresh_nodes = os.getenv("REFRESH_NODES", "true").lower() == "true"
-    device = os.getenv("DEVICE", "cpu")
+    device = os.getenv("DEVICE", "cuda")
 
     assert netuid is not None, "Must set NETUID env var please!"
 
