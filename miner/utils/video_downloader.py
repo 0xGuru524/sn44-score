@@ -1,9 +1,12 @@
-import tempfile
 from pathlib import Path
 import httpx
 from fastapi import HTTPException
 from tenacity import retry, stop_after_attempt, wait_exponential
 from loguru import logger
+import subprocess
+import time
+import uuid
+import os
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
 async def download_video(url: str) -> Path:
@@ -19,38 +22,22 @@ async def download_video(url: str) -> Path:
     Raises:
         HTTPException: If download fails
     """
+    start = time.time()
     try:
-        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-            # First request to get the redirect
-            response = await client.get(url)
-            
-            if "drive.google.com" in url:
-                # For Google Drive, we need to handle the download URL specially
-                if "drive.usercontent.google.com" in response.url.path:
-                    download_url = str(response.url)
-                else:
-                    # If we got redirected to the Google Drive UI, construct the direct download URL
-                    file_id = url.split("id=")[1].split("&")[0]
-                    download_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download"
-                
-                # Make the actual download request
-                response = await client.get(download_url)
-            
-            response.raise_for_status()
-            
-            # Create temp file with .mp4 extension
-            temp_file = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
-            temp_file.write(response.content)
-            temp_file.close()
-            
-            logger.info(f"Video downloaded successfully to {temp_file.name}")
-            return Path(temp_file.name)
-            
-    except httpx.HTTPStatusError as e:
-        logger.error(f"HTTP error downloading video: {str(e)}")
-        logger.error(f"Response status code: {e.response.status_code}")
-        logger.error(f"Response headers: {e.response.headers}")
-        raise HTTPException(status_code=500, detail=f"Failed to download video: {str(e)}")
+        dir = '/dev/shm'
+        file_name = str(uuid.uuid4()) + '.mp4'
+        full_path = os.path.join(dir, file_name)
+        # result = subprocess.call(["wget", url, "-O", full_path, "-q"])
+        result = subprocess.call(["aria2c","-x", "16", "-s", "16", '-d', dir, "-o", file_name, url])
+        # result = subprocess.call(["axel", "-n", "10", "-p", "-o", full_path,  url])
+        elapsed = time.time() - start
+        if result == 0:
+            print("Downloaded video in {:.2f} seconds".format(elapsed))
+            return Path(full_path)
+        else:
+            print("Failed to download {} (wget error code {})".format(url, result))
     except Exception as e:
-        logger.error(f"Error downloading video: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to download video: {str(e)}") 
+        print("Failed to download {}: {}".format(url, e))
+        
+    return Path(url)
+    

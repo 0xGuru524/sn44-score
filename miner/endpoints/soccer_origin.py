@@ -9,6 +9,7 @@ from pydantic import BaseModel
 import asyncio
 from pathlib import Path
 from loguru import logger
+import torch
 
 from fiber.logging_utils import get_logger
 from miner.core.models.config import Config
@@ -64,10 +65,21 @@ async def process_soccer_video(
         tracking_data = {"frames": []}
         
         async for frame_number, frame in video_processor.stream_frames(video_path):
-            pitch_result = pitch_model(frame, verbose=False)[0]
-            keypoints = sv.KeyPoints.from_ultralytics(pitch_result)
+            # Create two CUDA streams
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+            pitch_result = player_result = None
+            # Launch model1 on stream1
+            with torch.cuda.stream(s1):
+                pitch_result = pitch_model(frame, verbose=False)[0]    # asynchronous launch into s1
+
+            # Launch model2 on stream2
+            with torch.cuda.stream(s2):
+                player_result = player_model(frame, imgsz=1280, verbose=False)[0]    # asynchronous launch into s2
+                # Wait for both streams to finish
+            torch.cuda.synchronize()
             
-            player_result = player_model(frame, imgsz=1280, verbose=False)[0]
+            keypoints = sv.KeyPoints.from_ultralytics(pitch_result)
             detections = sv.Detections.from_ultralytics(player_result)
             detections = tracker.update_with_detections(detections)
             

@@ -1,290 +1,239 @@
 import os
 import json
 import time
-from typing import Optional, Dict, Any
-import numpy as np
-import cv2
-from fastapi import APIRouter, Depends, HTTPException, Request
-import asyncio
+from typing import Optional, Dict, Any, List, Tuple
 import supervision as sv
-from loguru import logger
+import numpy as np
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
+import asyncio
 from pathlib import Path
+from loguru import logger
+import cv2
+import math
+import shlex
+import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing as mp
 
 from fiber.logging_utils import get_logger
 from miner.core.models.config import Config
 from miner.core.configuration import factory_config
 from miner.dependencies import get_config, verify_request, blacklist_low_stake
 from sports.configs.soccer import SoccerPitchConfiguration
-from miner.utils.device import get_optimal_device
-from miner.utils.model_manager import ModelManager, infer_with_trt
-from miner.utils.video_downloader import download_video
-from miner.utils.video_processor import VideoProcessor
+from miner.utils.model_manager import ModelManager
 from miner.utils.shared import miner_lock
+from miner.utils.video_downloader import download_video
+from miner.endpoints.player_detection_thread import process_player_detection
+from miner.endpoints.pitch_detection_thread import process_pitch_detection
+from miner.utils.video_processor_cuda import VideoProcessor
+from miner.utils.device import get_optimal_device
+
+# Make sure we use 'spawn' so CUDA contexts don't get copied
+mp.set_start_method('spawn', force=True)
 
 logger = get_logger(__name__)
-CONFIG = factory_config(SoccerPitchConfiguration)
 
-# Global model manager instance
-model_manager: Optional[ModelManager] = None
-calib_dir = Path('calibration_images')  # populate with representative images
+CONFIG = SoccerPitchConfiguration()
 
-def get_model_manager(config: Config = Depends(get_config)) -> ModelManager:
-    global model_manager
-    if model_manager is None:
-        # Use small fp16 TRT engines for balanced speed/accuracy
-        model_manager = ModelManager(
-            device=config.device,
-            precision='int8', 
-            model_size='m', 
-            calibration_dir=calib_dir
-        )
-        # Eagerly build engines
-        for name in ("player", "pitch", "ball"):
-            model_manager.get_trt_engine(name)
-    return model_manager
+N_CHUNKS = 3           # ← change to 10 pieces
+WORKERS  = 1   # e.g. cap at 4 ffmpeg jobs at once (tweak to your CPU/RAM)
 
+model_managers = []
 
-# --- 2. Video Processor (Stream-optimized) ---
-async def probe_video(url: str) -> Tuple[int, int, float, str]:
-    """Probe resolution, fps, and codec via ffprobe JSON parsing with fallback download."""
-    import tempfile, requests, os, json
+for i in range(WORKERS):
+    model_manager = ModelManager(device=get_optimal_device('gpu'), idx=i)
+    model_manager.load_all_models()
+    model_managers.append(model_manager)
 
-    async def _run_ffprobe_json(path: str) -> Tuple[int, int, float, str]:
-        # Use JSON output to reliably parse streams
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-print_format", "json",
-            "-show_streams",
-            path
-        ]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
-        )
-        out, err = await proc.communicate()
-        if proc.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail=f"ffprobe JSON error for {path}: {err.decode().strip()}"
-            )
-        info = json.loads(out)
-        streams = info.get("streams", [])
-        for s in streams:
-            if s.get("codec_type") == "video":
-                w = s.get("width")
-                h = s.get("height")
-                fps_str = s.get("r_frame_rate", "0/1")
-                codec = s.get("codec_name", "")
-                if w is None or h is None:
-                    continue
-                # parse fps
-                if "/" in fps_str:
-                    num_str, den_str = fps_str.split("/")
-                    try:
-                        num, den = int(num_str), int(den_str)
-                    except ValueError:
-                        num, den = 0, 1
-                else:
-                    try:
-                        num, den = int(fps_str), 1
-                    except ValueError:
-                        num, den = 0, 1
-                fps = num / den if den else float(num)
-                return w, h, fps, codec
-        raise HTTPException(
-            status_code=400,
-            detail="No video stream found in ffprobe output"
-        )
+def get_batches_frames(path, duration_sec=3.0):
+    """
+    Yields batches of frames (as NumPy arrays) from a video at `path`,
+    each batch covering approximately `duration_sec` seconds.
+    """
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        raise IOError(f"Cannot open video: {path}")
 
-    # Try probing URL directly
-    try:
-        return await _run_ffprobe_json(url)
-    except HTTPException as e:
-        if "Protocol not found" in getattr(e, 'detail', ''):
-            tmpf = tempfile.NamedTemporaryFile(suffix=os.path.splitext(url)[-1], delete=False)
-            tmpf.close()
-            try:
-                resp = requests.get(url, stream=True, timeout=10)
-                resp.raise_for_status()
-                with open(tmpf.name, 'wb') as f:
-                    for chunk in resp.iter_content(chunk_size=1<<20):
-                        if chunk:
-                            f.write(chunk)
-                return await _run_ffprobe_json(tmpf.name)
-            finally:
-                try: os.remove(tmpf.name)
-                except: pass
-        raise
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    per_bs = math.ceil(fps * duration_sec)
 
+    batch = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            if batch:
+                yield batch
+            break
+        
+        # gpu = cv2.cuda_GpuMat()
+        # gpu.upload(frame)
+        
+        # print("GPU empty?", gpu.empty())
+        # # Multiple operations
+        frame = cv2.resize(frame, (640, 640))
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # gpu_rgb = gpu_rgb.convertTo(cv2.CV_32F, alpha=1.0 / 255.0, beta=0, stream=None)
+        # result = gpu_rgb.download()
+        batch.append(frame)  # frame is a NumPy array on the CPU
+        if len(batch) >= per_bs:
+            yield batch
+            batch = []
+            
+    cap.release()
 
+def get_duration(path):
+    """Return total duration in seconds via ffprobe."""
+    cmd = (
+        "ffprobe -v error "
+        "-show_entries format=duration "
+        "-of default=noprint_wrappers=1:nokey=1 "
+        f"{shlex.quote(path)}"
+    )
+    out = subprocess.run(shlex.split(cmd), capture_output=True, text=True, check=True).stdout
+    return float(out.strip())
+
+def _worker_player(
+    idx: int,
+    batch_frames: List[Any],
+    model_manger: ModelManager
+) -> Tuple[int, Dict[str, Any]]:
+    """
+    This runs in a separate process:
+     - Re-build the ModelManager from config
+     - Run both player & pitch detection on the batch
+    Returns (batch_index, player_results, pitch_results)
+    """    
+    # 2) Run player detection
+    player_data = process_player_detection(idx, batch_frames, model_manager)
+
+    return idx, player_data
+
+def _worker_pitch(
+    idx: int,
+    batch_frames: List[Any],
+    model_manger: ModelManager
+) -> Tuple[int, Dict[str, Any]]:
+    """
+    This runs in a separate process:
+     - Re-build the ModelManager from config
+     - Run both player & pitch detection on the batch
+    Returns (batch_index, player_results, pitch_results)
+    """    
+
+    # 3) Run pitch detection
+    pitch_data  = process_pitch_detection(idx, batch_frames, model_manager)
+
+    return idx, pitch_data
 
 async def process_soccer_video(
-    video_path: str,
-    model_manager: ModelManager,
+    video_path: str
 ) -> Dict[str, Any]:
     """
     Process a soccer video via CUDA-accelerated decode and TRT inference.
     """
-    start = time.time()
-    width, height, _, codec = await probe_video(input_source)
-    frame_size = width*height*3
+    start_time = time.time()
     
-    player_engine = mgr.get_trt_engine('player')
-    pitch_engine = mgr.get_trt_engine('pitch')
+    total = get_duration(video_path)
+    seg_len = total / WORKERS
+    print(f"Total duration: {total:.2f}s → {WORKERS} slices of {seg_len:.2f}s each")
     
-    tracker = sv.ByteTrack()
     
-    tracking_data = {"frames": []}
+     # 1) Build the list of batches
+    batches = list(enumerate(get_batches_frames(video_path, seg_len)))
+
+    # 2) Pull out only the serializable bits to re-create ModelManager in each child
+
+    player_results = {}
+    pitch_results  = {}
+
+    # 3) Fire up the process pool
+    with ThreadPoolExecutor(max_workers=WORKERS) as exe:
+        futures_player = {
+            exe.submit(_worker_player, idx, batch, model_managers[idx]): idx
+            for idx, batch in batches
+        }
+        futures_pitch = {
+            exe.submit(_worker_player, idx, batch, model_managers[idx]): idx
+            for idx, batch in batches
+        }
+
+        # 4) As each process finishes, gather its results
+        for fut in as_completed(futures_player):
+            idx = futures_player[fut]
+            try:
+                _, player_data = fut.result()
+                player_results[idx] = player_data
+            except Exception as e:
+                logger.exception(f"Batch {idx} crashed in subprocess")
+                # Decide if you want to keep going or abort
+                raise
+        # 4) As each process finishes, gather its results
+        for fut in as_completed(futures_pitch):
+            idx = futures_pitch[fut]
+            try:
+                _, pitch_data = fut.result()
+                pitch_results[idx] = pitch_data
+            except Exception as e:
+                logger.exception(f"Batch {idx} crashed in subprocess")
+                # Decide if you want to keep going or abort
+                raise
+    # 5) Re-order into lists
+    ordered_idxs   = sorted(player_results.keys())
+    player_output  = [player_results[i] for i in ordered_idxs]
+    pitch_output   = [pitch_results[i]  for i in ordered_idxs]     
         
-    ffmpeg_cmd = [
-        'ffmpeg', "-hide_banner",
-        "-hwaccel", "cuda",
-        '-loglevel', 'error',
-        '-fflags', 'nobuffer',
-        '-flags', 'low_delay',
-        '-i', video_url,
-        '-c:v', 'h264_cuvid',
-        '-preset', 'ultrafast',
-        '-tune', 'zerolatency',
-        '-pix_fmt', 'bgr24',
-        '-f', 'mpegts',
-        '-an',
-        '-'
-    ]
-    pipe = await asyncio.create_subprocess_exec(
-        ffmpeg_cmd,
-            stdout=subprocess.PIPE, 
-            stderr=subprocess.PIPE
-    )
-    try:
-        frame_number = 0
-        while True:
-            # Read raw bytes for a single frame
-            raw_frame = pipe.stdout.read(frame_size)
-            if len(raw_frame) < frame_size:
-                # End of stream
-                break
-            # Convert to NumPy array and reshape
-            frame = np.frombuffer(raw_frame, dtype=np.uint8).reshape((height, width, 3))
-            frame_number = frame_number + 1
-            # Example processing: convert to grayscale and edge detection
-            pitch_result = infer_with_trt(pitch_engine, frame, scales=[1.0,0.75], flip=True)
-            keypoints = sv.KeyPoints.from_ultralytics(pitch_result)
-            
-            player_result = infer_with_trt(player_engine, frame, scales=[1.0,0.75], flip=True)
-            detections = sv.Detections.from_ultralytics(player_result)
-            detections = tracker.update_with_detections(detections)
-            
-            # Convert numpy arrays to Python native types
-            frame_data = {
-                "frame_number": int(frame_number),  # Convert to native int
-                "keypoints": keypoints.xy[0].tolist() if keypoints and keypoints.xy is not None else [],
-                "objects": [
-                    {
-                        "id": int(tracker_id),  # Convert numpy.int64 to native int
-                        "bbox": [float(x) for x in bbox],  # Convert numpy.float32/64 to native float
-                        "class_id": int(class_id)  # Convert numpy.int64 to native int
-                    }
-                    for tracker_id, bbox, class_id in zip(
-                        detections.tracker_id,
-                        detections.xyxy,
-                        detections.class_id
-                    )
-                ] if detections and detections.tracker_id is not None else []
-            }
-            tracking_data["frames"].append(frame_data)
-            
-            if frame_number % 100 == 0:
-                elapsed = time.time() - start_time
-                fps = frame_number / elapsed if elapsed > 0 else 0
-                logger.info(f"Processed {frame_number} frames in {elapsed:.1f}s ({fps:.2f} fps)")
-
-    finally:
-        pipe.stdout.close()
-        pipe.wait()
-        cv2.destroyAllWindows()
-
-    # Prepare TRT engines
-    engine_player = model_manager.get_trt_engine("player")
-    engine_pitch  = model_manager.get_trt_engine("pitch")
-    engine_ball   = model_manager.get_trt_engine("ball")
-    tracker = sv.ByteTrack()
-
-    tracking_data = {"frames": []}
-
-    # Stream frames
-    async for frame_number, frame in video_processor.stream_frames(video_path):
-        # Convert BGR->RGB
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-        # Pitch keypoints
-        pitch_preds = infer_with_trt(engine_pitch, rgb, scales=[1.0], flip=False)
-        keypoints = sv.KeyPoints(xy=pitch_preds[:, :2] if pitch_preds.size else np.empty((0,2)))
-
-        # Player detections + tracking
-        player_preds = infer_with_trt(engine_player, rgb, scales=[1.0], flip=False)
-        det = sv.Detections(
-            xyxy=player_preds[:, :4],
-            confidence=player_preds[:, 4],
-            class_id=player_preds[:, 5].astype(int)
-        )
-        tracked = tracker.update_with_detections(det)
-
-        # Ball detection (optional)
-        ball_preds = infer_with_trt(engine_ball, rgb, scales=[1.0], flip=False)
-        ball_det = sv.Detections(
-            xyxy=ball_preds[:, :4],
-            confidence=ball_preds[:, 4],
-            class_id=ball_preds[:, 5].astype(int)
-        )
-
-        # Format frame data
-        objs = []
-        # players
-        for tid, box, cls in zip(tracked.tracker_id or [], tracked.xyxy or [], tracked.class_id or []):
-            objs.append({"id": int(tid), "bbox": box.tolist(), "class_id": int(cls)})
-        # balls
-        for box, conf, cls in zip(ball_det.xyxy, ball_det.confidence, ball_det.class_id):
-            objs.append({"id": None, "bbox": box.tolist(), "class_id": int(cls), "confidence": float(conf)})
-
-        tracking_data["frames"].append({
-            "frame_number": int(frame_number),
-            "keypoints": keypoints.xy.tolist() if keypoints.xy is not None else [],
-            "objects": objs
-        })
-
-        # Log progress
-        if frame_number % 100 == 0:
-            elapsed = time.time() - start
-            fps = frame_number / elapsed if elapsed>0 else 0
-            logger.info(f"Processed {frame_number} frames in {elapsed:.1f}s ({fps:.2f} fps)")
-
-    processing_time = time.time() - start
-    tracking_data["processing_time"] = processing_time
-    total = len(tracking_data["frames"])
-    logger.info(f"Completed {total} frames in {processing_time:.1f}s ({total/processing_time:.2f} fps)")
-    return tracking_data
-
 async def process_challenge(
     request: Request,
-    config: Config = Depends(get_config),
-    model_manager: ModelManager = Depends(get_model_manager),
+    config: Config = Depends(get_config)
 ):
+    logger.info("Attempting to acquire miner lock...")
     async with miner_lock:
-        data = await request.json()
-        cid = data.get("challenge_id")
-        url = data.get("video_url")
-        if not url:
-            raise HTTPException(400, "No video URL provided")
-        logger.info(f"Challenge {cid}: downloading {url}")
+        logger.info("Miner lock acquired, processing challenge...")
         try:
-            stats = await process_soccer_video(video_path, model_manager)
-            return {"challenge_id": cid, **stats}
+            challenge_data = await request.json()
+            challenge_id = challenge_data.get("challenge_id")
+            video_url = challenge_data.get("video_url")
+            
+            logger.info(f"Received challenge data: {json.dumps(challenge_data, indent=2)}")
+            
+            if not video_url:
+                raise HTTPException(status_code=400, detail="No video URL provided")
+            
+            logger.info(f"Processing challenge {challenge_id} with video {video_url}")
+            
+            video_path = await download_video(video_url)
+            
+            try:
+                tracking_data = await process_soccer_video(
+                    video_path
+                )
+                
+                response = {
+                    "challenge_id": challenge_id,
+                    "frames": tracking_data["frames"],
+                    "processing_time": tracking_data["processing_time"]
+                }
+                
+                logger.info(f"Completed challenge {challenge_id} in {tracking_data['processing_time']:.2f} seconds")
+                return response
+                
+            finally:
+                try:
+                    os.unlink(video_path)
+                except:
+                    pass
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error processing soccer challenge: {str(e)}")
+            logger.exception("Full error traceback:")
+            raise HTTPException(status_code=500, detail=f"Challenge processing error: {str(e)}")
         finally:
-            try: os.unlink(video_path)
-            except: pass
+            logger.info("Releasing miner lock...")
 
+# Create router with dependencies
 router = APIRouter()
 router.add_api_route(
     "/challenge",

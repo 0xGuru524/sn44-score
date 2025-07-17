@@ -13,7 +13,7 @@ sys.path.insert(0, miner_dir)
 
 from utils.model_manager import ModelManager
 from utils.video_downloader import download_video
-from endpoints.soccer import process_soccer_video
+from endpoints.soccer_origin import process_soccer_video
 from utils.device import get_optimal_device
 from scripts.download_models import download_models
 

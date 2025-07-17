@@ -12,7 +12,7 @@ import numpy as np
 from miner.utils.device import get_optimal_device
 from scripts.download_models import download_models
 
-TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+TRT_LOGGER = trt.Logger(trt.Logger.INFO)
 
 # --------------------- INT8 Calibrator ---------------------
 class Int8Calibrator(trt.IInt8EntropyCalibrator2):
@@ -66,7 +66,7 @@ class ModelManager:
         self,
         device: Optional[str] = None,
         precision: str = "int8",
-        model_size: str = "s",       # 'n', 's', 'm', 'l', 'x'
+        model_size: str = "m",       # 'n', 's', 'm', 'l', 'x'
         calibration_dir: Optional[Path] = None,
         calibration_batch: int = 8,
     ):
@@ -88,7 +88,7 @@ class ModelManager:
             "ball":   "football-ball-detection",
         }
         self.model_paths = {
-            name: self.data_dir / f"{base}_{self.model_size}.pt"
+            name: self.data_dir / f"{base}.pt"
             for name, base in base_names.items()
         }
         self.onnx_paths = {n: p.with_suffix('.onnx') for n,p in self.model_paths.items()}
@@ -103,7 +103,7 @@ class ModelManager:
         missing = [n for n,p in self.model_paths.items() if not p.exists()]
         if missing:
             logger.info(f"Missing models: {', '.join(missing)}. Downloading size={self.model_size}...")
-            download_models(size=self.model_size)
+            download_models()
 
     def load_model(self, name: str) -> YOLO:
         if name in self.models:
@@ -137,14 +137,16 @@ class ModelManager:
         builder = trt.Builder(TRT_LOGGER)
         network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
         parser = trt.OnnxParser(network, TRT_LOGGER)
-        with open(str(onnx_path),'rb') as f:
+
+        with open(str(onnx_path), 'rb') as f:
             if not parser.parse(f.read()):
                 for i in range(parser.num_errors):
                     logger.error(parser.get_error(i))
                 raise RuntimeError("ONNX parse failed")
 
         config = builder.create_builder_config()
-        config.max_workspace_size = workspace * 1024 * 1024
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace * (1 << 20))
+
         if self.precision == 'fp16' and builder.platform_has_fast_fp16:
             config.set_flag(trt.BuilderFlag.FP16)
         elif self.precision == 'int8' and builder.platform_has_fast_int8:
@@ -155,18 +157,25 @@ class ModelManager:
             calibrator = Int8Calibrator(
                 image_dir=self.calibration_dir,
                 batch_size=self.calibration_batch,
-                input_shape=(640,640),
+                input_shape=(640, 640),
                 cache_file=cache_file
             )
-            config.set_int8_calibrator(calibrator)
+            config.int8_calibrator = calibrator  # Updated API usage for TRT 10.x
 
         profile = builder.create_optimization_profile()
-        profile.set_shape('images', (1,3,640,640), (1,3,640,640), (1,3,640,640))
+        profile.set_shape("images", (1,3,640,640), (1,3,640,640), (1,3,640,640))
         config.add_optimization_profile(profile)
 
-        engine = builder.build_engine(network, config)
-        with open(engine_path,'wb') as f:
-            f.write(engine.serialize())
+        serialized_engine = builder.build_serialized_network(network, config)
+        if serialized_engine is None:
+            raise RuntimeError("Failed to build TensorRT engine")
+
+        with trt.Runtime(TRT_LOGGER) as runtime:
+            engine = runtime.deserialize_cuda_engine(serialized_engine)
+
+        with open(engine_path, 'wb') as f:
+            f.write(serialized_engine)
+
         self.engines[name] = engine
         return engine
 

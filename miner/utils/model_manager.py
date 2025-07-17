@@ -2,9 +2,18 @@ from pathlib import Path
 from typing import Dict, Optional
 from ultralytics import YOLO
 from loguru import logger
+from torch.serialization import safe_globals, add_safe_globals
+from ultralytics.nn.tasks import DetectionModel
+from torch.nn.modules.container import Sequential
+from ultralytics.nn.modules import Conv
+from torch.nn.modules.conv import Conv2d
+from torch.nn.modules.batchnorm     import BatchNorm2d
+from torch.nn.modules.activation     import SiLU
 
 from miner.utils.device import get_optimal_device
 from scripts.download_models import download_models
+
+add_safe_globals([DetectionModel, Sequential, Conv, Conv2d, BatchNorm2d, SiLU])
 
 class ModelManager:
     """Manages the loading and caching of YOLO models."""
@@ -47,6 +56,7 @@ class ModelManager:
         Returns:
             YOLO: The loaded model
         """
+        model = None
         if model_name in self.models:
             return self.models[model_name]
         
@@ -61,8 +71,11 @@ class ModelManager:
             )
         
         logger.info(f"Loading {model_name} model from {model_path} to {self.device}")
-        model = YOLO(str(model_path)).to(device=self.device)
-        self.models[model_name] = model
+        
+        with safe_globals([DetectionModel, Sequential, Conv, Conv2d, BatchNorm2d, SiLU]):
+            model = YOLO(str(model_path)).to(device=self.device)
+            self.models[model_name] = model
+            
         return model
     
     def load_all_models(self) -> None:
