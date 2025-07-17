@@ -78,6 +78,17 @@ class ModelManager:
             
         return model
     
+    def exportTensorRT(self) -> bool:
+        """Load all models into cache."""
+        for model_name in self.model_paths.keys():
+            model = self.load_model(model_name)
+            model.export(
+                format='engine',
+                half=True,
+                batch=16,
+                device=0
+            )
+    
     def load_all_models(self) -> None:
         """Load all models into cache."""
         for model_name in self.model_paths.keys():
