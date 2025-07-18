@@ -1,7 +1,7 @@
 import os
 import json
 import time
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any
 import supervision as sv
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -9,44 +9,47 @@ from pydantic import BaseModel
 import asyncio
 from pathlib import Path
 from loguru import logger
+import torch
 import cv2
-import math
-import shlex
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import multiprocessing as mp
+import torch.nn.functional as F
+
 
 from fiber.logging_utils import get_logger
 from miner.core.models.config import Config
 from miner.core.configuration import factory_config
 from miner.dependencies import get_config, verify_request, blacklist_low_stake
 from sports.configs.soccer import SoccerPitchConfiguration
+from miner.utils.device import get_optimal_device
 from miner.utils.model_manager import ModelManager
+from miner.utils.video_processor import VideoProcessor
 from miner.utils.shared import miner_lock
 from miner.utils.video_downloader import download_video
-from miner.endpoints.player_detection_thread import process_player_detection
-from miner.endpoints.pitch_detection_thread import process_pitch_detection
-from miner.utils.video_processor_cuda import VideoProcessor
-from miner.utils.device import get_optimal_device
-
-# Make sure we use 'spawn' so CUDA contexts don't get copied
-mp.set_start_method('spawn', force=True)
 
 logger = get_logger(__name__)
 
 CONFIG = SoccerPitchConfiguration()
 
-N_CHUNKS = 3           # ← change to 10 pieces
-WORKERS  = 1   # e.g. cap at 4 ffmpeg jobs at once (tweak to your CPU/RAM)
+# Global model manager instance
+model_manager = None
 
-model_managers = []
+def get_model_manager(config: Config = Depends(get_config)) -> ModelManager:
+    global model_manager
+    if model_manager is None:
+        model_manager = ModelManager(device=config.device)
+        model_manager.load_all_models()
+    return model_manager
 
-for i in range(WORKERS):
-    model_manager = ModelManager(device=get_optimal_device('gpu'), idx=i)
-    model_manager.load_all_models()
-    model_managers.append(model_manager)
 
-def get_batches_frames(path, duration_sec=3.0):
+# Load models
+model_manager = get_model_manager(get_config())
+
+player_model = model_manager.get_model("player")
+pitch_model = model_manager.get_model("pitch")
+tracker = sv.ByteTrack()
+
+    
+def get_batches_frames(path, batch_size=16):
     """
     Yields batches of frames (as NumPy arrays) from a video at `path`,
     each batch covering approximately `duration_sec` seconds.
@@ -54,9 +57,6 @@ def get_batches_frames(path, duration_sec=3.0):
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise IOError(f"Cannot open video: {path}")
-
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    per_bs = math.ceil(fps * duration_sec)
 
     batch = []
     while True:
@@ -66,123 +66,132 @@ def get_batches_frames(path, duration_sec=3.0):
                 yield batch
             break
         
-        # gpu = cv2.cuda_GpuMat()
-        # gpu.upload(frame)
+        gpu = cv2.cuda_GpuMat()
+        gpu.upload(frame)
         
         # print("GPU empty?", gpu.empty())
         # # Multiple operations
-        frame = cv2.resize(frame, (640, 640))
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.cuda.resize(gpu, (1280, 736))
+        frame = cv2.cuda.cvtColor(frame, cv2.COLOR_BGR2RGB)
         # gpu_rgb = gpu_rgb.convertTo(cv2.CV_32F, alpha=1.0 / 255.0, beta=0, stream=None)
-        # result = gpu_rgb.download()
+        frame = frame.download()
+        
         batch.append(frame)  # frame is a NumPy array on the CPU
-        if len(batch) >= per_bs:
+        if len(batch) >= batch_size:
             yield batch
             batch = []
             
     cap.release()
 
-def get_duration(path):
-    """Return total duration in seconds via ffprobe."""
-    cmd = (
-        "ffprobe -v error "
-        "-show_entries format=duration "
-        "-of default=noprint_wrappers=1:nokey=1 "
-        f"{shlex.quote(path)}"
-    )
-    out = subprocess.run(shlex.split(cmd), capture_output=True, text=True, check=True).stdout
-    return float(out.strip())
-
-def _worker_player(
-    idx: int,
-    batch_frames: List[Any],
-    model_manger: ModelManager
-) -> Tuple[int, Dict[str, Any]]:
-    """
-    This runs in a separate process:
-     - Re-build the ModelManager from config
-     - Run both player & pitch detection on the batch
-    Returns (batch_index, player_results, pitch_results)
-    """    
-    # 2) Run player detection
-    player_data = process_player_detection(idx, batch_frames, model_manager)
-
-    return idx, player_data
-
-def _worker_pitch(
-    idx: int,
-    batch_frames: List[Any],
-    model_manger: ModelManager
-) -> Tuple[int, Dict[str, Any]]:
-    """
-    This runs in a separate process:
-     - Re-build the ModelManager from config
-     - Run both player & pitch detection on the batch
-    Returns (batch_index, player_results, pitch_results)
-    """    
-
-    # 3) Run pitch detection
-    pitch_data  = process_pitch_detection(idx, batch_frames, model_manager)
-
-    return idx, pitch_data
-
 async def process_soccer_video(
     video_path: str
 ) -> Dict[str, Any]:
-    """
-    Process a soccer video via CUDA-accelerated decode and TRT inference.
-    """
-    start_time = time.time()
+    """Process a soccer video and return tracking data."""
     
-    total = get_duration(video_path)
-    seg_len = total / WORKERS
-    print(f"Total duration: {total:.2f}s → {WORKERS} slices of {seg_len:.2f}s each")
+    batch_size = 16 
+    imgsz = (736, 1280)  # height, width
+    device = get_optimal_device('cuda')
     
-    
-     # 1) Build the list of batches
-    batches = list(enumerate(get_batches_frames(video_path, seg_len)))
-
-    # 2) Pull out only the serializable bits to re-create ModelManager in each child
-
-    player_results = {}
-    pitch_results  = {}
-
-    # 3) Fire up the process pool
-    with ThreadPoolExecutor(max_workers=WORKERS) as exe:
-        futures_player = {
-            exe.submit(_worker_player, idx, batch, model_managers[idx]): idx
-            for idx, batch in batches
-        }
-        futures_pitch = {
-            exe.submit(_worker_player, idx, batch, model_managers[idx]): idx
-            for idx, batch in batches
-        }
-
-        # 4) As each process finishes, gather its results
-        for fut in as_completed(futures_player):
-            idx = futures_player[fut]
-            try:
-                _, player_data = fut.result()
-                player_results[idx] = player_data
-            except Exception as e:
-                logger.exception(f"Batch {idx} crashed in subprocess")
-                # Decide if you want to keep going or abort
-                raise
-        # 4) As each process finishes, gather its results
-        for fut in as_completed(futures_pitch):
-            idx = futures_pitch[fut]
-            try:
-                _, pitch_data = fut.result()
-                pitch_results[idx] = pitch_data
-            except Exception as e:
-                logger.exception(f"Batch {idx} crashed in subprocess")
-                # Decide if you want to keep going or abort
-                raise
-    # 5) Re-order into lists
-    ordered_idxs   = sorted(player_results.keys())
-    player_output  = [player_results[i] for i in ordered_idxs]
-    pitch_output   = [pitch_results[i]  for i in ordered_idxs]     
+    try:             
+        start_time = time.time()
+        tracking_data = {"frames": []}
+        pitch_frame_data = []
+        player_frame_data = []
+        for frame_number, frames in enumerate(get_batches_frames(video_path, batch_size)):
+            exceed_size = 0
+            t0 = time.time()
+            # Create two CUDA streams
+            B = len(frames)
+            s1 = torch.cuda.Stream()
+            s2 = torch.cuda.Stream()
+                # Convert to torch.Tensor [B, C, H, W]
+            if B < batch_size:
+                exceed_size = batch_size - B
+                empty_frame = np.zeros((imgsz[0], imgsz[1], 3), dtype=np.uint8)
+                frames.extend([empty_frame] * (batch_size - B))
+                
+            # Launch model1 on stream1
+            with torch.cuda.stream(s1):
+                pitch_results = pitch_model.predict(source=frames, verbose=False, conf=0.25, iou=0.45, agnostic_nms=False, max_det=2, device=0)    # asynchronous launch into s1
+                if exceed_size > 0:
+                    pitch_results = pitch_results[:-exceed_size]
+                for idx, pitch_result in enumerate(pitch_results):
+                    logger.info(f"Processed frames: {pitch_result[0]}")
+                    
+                    keypoints = []
+                    try:
+                        keypoints = sv.KeyPoints.from_ultralytics(pitch_result[0])
+                    except AttributeError:
+                        keypoints = []
+                        
+                    frame_data = {
+                        "frame_number": int(frame_number * batch_size + idx),  # Convert to native int
+                        "keypoints": keypoints.xy[0].tolist() if keypoints and keypoints.xy is not None else [],
+                    }
+                    pitch_frame_data.append(frame_data)
+                    
+            # Launch model2 on stream2
+            with torch.cuda.stream(s2):
+                player_results = player_model.predict(source=frames, verbose=False, conf=0.25, iou=0.45, agnostic_nms=False, max_det=50, device=0)    # asynchronous launch into s2
+                if exceed_size > 0:
+                    player_results = player_results[:-exceed_size]
+                for idx, player_result in enumerate(player_results):
+                    detections = sv.Detections.from_ultralytics(player_result[0])
+                    detections = tracker.update_with_detections(detections)
+                    frame_data = {
+                        "frame_number": int(frame_number * 16 + idx),  # Convert to native int
+                        "objects": [
+                            {
+                                "id": int(tracker_id),  # Convert numpy.int64 to native int
+                                "bbox": [float(x) for x in bbox],  # Convert numpy.float32/64 to native float
+                                "class_id": int(class_id)  # Convert numpy.int64 to native int
+                            }
+                            for tracker_id, bbox, class_id in zip(
+                                detections.tracker_id,
+                                detections.xyxy,
+                                detections.class_id
+                            )
+                        ] if detections and detections.tracker_id is not None else []
+                    }
+                    player_frame_data.append(frame_data)
+            # Wait for both streams to finish
+            torch.cuda.synchronize()
+              
+            elapsed = time.time() - t0
+            fps = frame_number / elapsed if elapsed > 0 else 0
+            logger.info(f"Processed {B} frames in {elapsed:.1f}s ({fps:.2f} fps)")
         
+        frame_data = pitch_frame_data
+        if len(pitch_frame_data) > len(player_frame_data):
+            frame_data = player_frame_data
+            
+        logger.info(
+            f"Pitch Data Length:  {len(pitch_frame_data)} vs Player Data Length: {len(player_frame_data)}"
+        )
+        for idx, frame in enumerate(frame_data):
+            tracked = {
+                "frame_number": int(idx),
+                "keypoints": pitch_frame_data[idx]["keypoints"],
+                "objects": player_frame_data[idx]["objects"]
+            }
+            tracking_data["frames"].append(tracked)
+            
+        processing_time = time.time() - start_time
+        tracking_data["processing_time"] = processing_time
+        
+        total_frames = len(tracking_data["frames"])
+        fps = total_frames / processing_time if processing_time > 0 else 0
+        logger.info(
+            f"Completed processing {total_frames} frames in {processing_time:.1f}s "
+            f"({fps:.2f} fps) on {model_manager.device} device"
+        )
+        
+        return tracking_data
+        
+    except Exception as e:
+        logger.error(f"Error processing video: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Video processing error: {str(e)}")
+
 async def process_challenge(
     request: Request,
     config: Config = Depends(get_config)

@@ -92,8 +92,7 @@ async def main():
             
             logger.info("Starting video processing...")
             result = await process_soccer_video(
-                video_path=str(video_path),
-                model_manager=model_manager
+                video_path=str(video_path)
             )
             
             logger.info("Optimizing frame data...")

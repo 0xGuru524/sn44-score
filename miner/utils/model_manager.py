@@ -28,9 +28,11 @@ class ModelManager:
         self.model_paths = {
             "player": self.data_dir / "football-player-detection.pt",
             "pitch": self.data_dir / "football-pitch-detection.pt",
-            "ball": self.data_dir / "football-ball-detection.pt"
         }
-        
+        self.engine_paths = {
+            "player": self.data_dir / "football-player-detection.engine",
+            "pitch": self.data_dir / "football-pitch-detection.engine",
+        }
         # Check if models exist, download if missing
         self._ensure_models_exist()
     
@@ -64,6 +66,7 @@ class ModelManager:
             raise ValueError(f"Unknown model: {model_name}")
         
         model_path = self.model_paths[model_name]
+        engine_path = self.engine_paths[model_name]
         if not model_path.exists():
             raise FileNotFoundError(
                 f"Model file not found: {model_path}. "
@@ -71,23 +74,25 @@ class ModelManager:
             )
         
         logger.info(f"Loading {model_name} model from {model_path} to {self.device}")
-        
-        with safe_globals([DetectionModel, Sequential, Conv, Conv2d, BatchNorm2d, SiLU]):
-            model = YOLO(str(model_path)).to(device=self.device)
-            self.models[model_name] = model
+        task = "detect" if model_name == 'player' else "pose"
+        model = YOLO(str(engine_path), task=task)
+        self.models[model_name] = model
             
         return model
     
-    def exportTensorRT(self) -> bool:
+    def exportTensorRT(self,  model_name:str, dynamic:bool=True,  batch_size:int=-1, device=0) -> bool:
         """Load all models into cache."""
-        for model_name in self.model_paths.keys():
-            model = self.load_model(model_name)
-            model.export(
-                format='engine',
-                half=True,
-                batch=16,
-                device=0
-            )
+        model_path = self.model_paths[model_name]
+        task = "detect" if model_name == 'player' else "pose"
+        model = YOLO(str(model_path), task=task).to(device)
+        model.export(
+            format='engine',
+            half=True,
+            batch=batch_size,
+            device=device,
+            imgsz=(736, 1280),
+            nms=True
+        )
     
     def load_all_models(self) -> None:
         """Load all models into cache."""
