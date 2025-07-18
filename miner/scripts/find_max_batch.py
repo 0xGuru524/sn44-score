@@ -20,5 +20,5 @@ def max_batch_size(model, imgsz=(640,640), device='cuda'):
 
 # Example:
 from ultralytics import YOLO
-model = YOLO('../data/football-pitch-detection.pt').to('cuda')
+model = YOLO('../data/football-player-detection.pt').to('cuda')
 print("Max batch:", max_batch_size(model, imgsz=(736,1280)))

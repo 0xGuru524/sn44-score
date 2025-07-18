@@ -22,8 +22,8 @@ async def main():
         model_manager = ModelManager(device=device)
         logger.info(f"Using device: {device}")
         logger.info("Starting model exporting...")
-        model_manager.exportTensorRT(model_name="pitch", dynamic=False, batch_size=16, device=device)
-        model_manager.exportTensorRT(model_name="player", dynamic=False, batch_size=16, device=device)
+        model_manager.exportTensorRT(model_name="pitch", dynamic=False, batch_size=32, device=device)
+        model_manager.exportTensorRT(model_name="player", dynamic=False, batch_size=32, device=device)
         logger.info("Models exported successfully")
         total_time = time.time() - start_time
         logger.info("Processing completed successfully!")

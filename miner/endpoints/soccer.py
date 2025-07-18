@@ -88,7 +88,7 @@ async def process_soccer_video(
 ) -> Dict[str, Any]:
     """Process a soccer video and return tracking data."""
     
-    batch_size = 16 
+    batch_size = 32 
     imgsz = (736, 1280)  # height, width
     device = get_optimal_device('cuda')
     
@@ -112,12 +112,10 @@ async def process_soccer_video(
                 
             # Launch model1 on stream1
             with torch.cuda.stream(s1):
-                pitch_results = pitch_model.predict(source=frames, verbose=False, conf=0.25, iou=0.45, agnostic_nms=False, max_det=2, device=0)    # asynchronous launch into s1
+                pitch_results = pitch_model.predict(source=frames, verbose=False, conf=0.25, iou=0.45, agnostic_nms=False, max_det=50, device=0)    # asynchronous launch into s1
                 if exceed_size > 0:
                     pitch_results = pitch_results[:-exceed_size]
                 for idx, pitch_result in enumerate(pitch_results):
-                    logger.info(f"Processed frames: {pitch_result[0]}")
-                    
                     keypoints = []
                     try:
                         keypoints = sv.KeyPoints.from_ultralytics(pitch_result[0])
@@ -156,18 +154,11 @@ async def process_soccer_video(
                     player_frame_data.append(frame_data)
             # Wait for both streams to finish
             torch.cuda.synchronize()
-              
-            elapsed = time.time() - t0
-            fps = frame_number / elapsed if elapsed > 0 else 0
-            logger.info(f"Processed {B} frames in {elapsed:.1f}s ({fps:.2f} fps)")
-        
+                     
         frame_data = pitch_frame_data
         if len(pitch_frame_data) > len(player_frame_data):
             frame_data = player_frame_data
             
-        logger.info(
-            f"Pitch Data Length:  {len(pitch_frame_data)} vs Player Data Length: {len(player_frame_data)}"
-        )
         for idx, frame in enumerate(frame_data):
             tracked = {
                 "frame_number": int(idx),
